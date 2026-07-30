@@ -1,9 +1,0 @@
-* Simple RC low-pass filter for the ltspice_mc Monte Carlo demo
-.param R=1k
-.param C=100n
-V1 in 0 AC 1
-R1 in out {R}
-C1 out 0 {C}
-.ac dec 200 10 1Meg
-.backanno
-.end
