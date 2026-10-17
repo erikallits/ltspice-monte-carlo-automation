@@ -192,6 +192,36 @@ kept separate from a single collapsed verdict — see `stability.py`'s module do
 each of the three checks (empirical MC / exhaustive corner / conservative Kharitonov) does and does not
 prove. `examples/run_my_circuit.py`'s `CONFIG` block is a topology-agnostic template covering all three.
 
+### Frequency normalization and sweep quality
+
+`fit_transfer_function_lstsq` internally normalizes frequency (dividing by the geometric mean of your
+sweep's range) before fitting and un-normalizes the result afterward — a sweep spanning many decades
+makes raw `s^k` terms span many more decades still, which is most of what actually causes ill-conditioning,
+and normalizing fixes it at the source rather than leaving a condition-number filter to catch it after
+the fact. This is transparent to callers (verified in tests by fitting the same data with and without
+normalization and checking the results agree) and dramatically improves both the reliability of automatic
+order selection and the accuracy of the recovered poles on wide sweeps.
+
+Normalization can't fix a sweep that's simply too **sparse or linearly-spaced** to resolve your circuit's
+poles/zeros at all — `check_frequency_sweep()` flags this directly, and `AutoFitResult.summary()` prints
+it prominently, first, before anything else, since a bad sweep can invalidate everything downstream of it.
+A `.ac lin 20 0.1 10k` directive (few points, linearly spaced) is a common, otherwise-silent cause of a
+nonsensical order choice — especially for anything frequency-selective, like a notch, where the interesting
+behavior can fall entirely between two widely-spaced samples. `set_ac_analysis()` rewrites a netlist's
+`.ac` directive in place (dense, log-spaced, by default) if you'd rather not edit it by hand.
+
+### Circuits with op-amps (or anything else with a subcircuit)
+
+Stability analysis works on **any** circuit LTspice can AC-simulate, active or passive, with no special
+handling needed — `fit_transfer_function_lstsq`/`auto_fit_transfer_function` only look at the AC output
+(`H(jω)` at your chosen nodes), never at what produced it. An op-amp's real behavior (from its actual
+vendor `.lib` model) is included in every Monte Carlo sample and every corner exactly as LTspice simulates
+it; `interactive_parameterize()` correctly leaves subcircuit instances (`X...` lines) untouched rather than
+misinterpreting a model name as a component value. What this does **not** do is let you statistically vary
+an op-amp's *own* internal characteristics (open-loop gain, GBW, offset) — a real vendor SPICE model is a
+fixed, non-parameterized subcircuit, and there's no way to manufacture tunability that isn't actually in
+the model.
+
 ## Module map
 
 | File | Responsibility |

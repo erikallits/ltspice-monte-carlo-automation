@@ -35,9 +35,42 @@ def get_signal(raw: RawLike, name: str, step: int = 0) -> np.ndarray:
     return np.asarray(trace.get_wave(step))
 
 
+def _coerce_real(arr: np.ndarray, context: str, rtol: float = 1e-6) -> np.ndarray:
+    """
+    LTspice's raw-file format stores an entire plot -- including the axis
+    itself -- with one uniform number type, so for AC analysis the
+    frequency axis comes back as complex128 even though frequency has no
+    meaningful imaginary part (it's always exactly/near-exactly 0). Left
+    alone, that silently propagates a complex dtype into every downstream
+    consumer (np.log10, np.interp, least-squares fits, ...), which either
+    raises a ComplexWarning-and-truncates or, worse, changes behavior
+    somewhere that doesn't warn. Fix it once, here, rather than leaving it
+    for every caller to trip over independently.
+
+    Validates the imaginary part actually IS negligible before discarding
+    it -- if it isn't, this raises instead of silently corrupting data,
+    since that would mean this isn't the axis-storage quirk at all but
+    something genuinely wrong.
+    """
+    arr = np.asarray(arr)
+    if not np.iscomplexobj(arr):
+        return arr
+    max_imag = float(np.max(np.abs(arr.imag))) if arr.size else 0.0
+    max_real = float(np.max(np.abs(arr.real))) if arr.size else 0.0
+    if max_imag > rtol * max(max_real, 1.0):
+        raise ValueError(
+            f"{context} has a non-negligible imaginary part (max |imag|={max_imag:.4g} vs "
+            f"max |real|={max_real:.4g}) -- this doesn't look like the usual complex-but-really-real "
+            "axis storage quirk, so refusing to silently discard it. Something else may be wrong."
+        )
+    return arr.real
+
+
 def get_axis(raw: RawLike, step: int = 0) -> np.ndarray:
-    """Fetch the X axis: time for .tran, frequency for .ac."""
-    return np.asarray(raw.get_axis(step))
+    """Fetch the X axis: time for .tran, frequency for .ac. Always returns a
+    real array (see _coerce_real) -- .tran's time axis already is real, so
+    this is a no-op there; .ac's frequency axis needs the fix."""
+    return _coerce_real(np.asarray(raw.get_axis(step)), context="axis")
 
 
 def _windowed(t: np.ndarray, y: np.ndarray, t_start: Optional[float], t_end: Optional[float]):

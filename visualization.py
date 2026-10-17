@@ -17,7 +17,7 @@ from matplotlib.figure import Figure
 
 from .engine import MonteCarloResults, SweepResult
 from .optimization import OptimizationResult
-from .stability import AutoFitResult, KharitonovResult
+from .stability import AutoFitResult, KharitonovResult, stability_margin, transfer_function_to_latex
 
 
 def _valid_values(results: MonteCarloResults, metric: str) -> np.ndarray:
@@ -325,6 +325,131 @@ def plot_order_selection(auto_fit: AutoFitResult, save_path: Optional[Union[str,
     if save_path:
         fig.savefig(save_path, dpi=150)
     return fig
+
+
+def plot_stability_margin_histogram(
+    den_coeffs_stack: np.ndarray,
+    title: str = "Stability margin across samples",
+    save_path: Optional[Union[str, Path]] = None,
+) -> Figure:
+    """
+    Histogram of max(Re(pole)) per sample (stability_margin() in
+    stability.py) -- negative is stable, positive is unstable, magnitude is
+    rough distance from the boundary. Works for ANY extracted D(s)
+    regardless of topology or which (if any) scalar metrics were also
+    measured -- this is the natural thing to histogram for a purely
+    stability-focused Monte Carlo run that has no other metric at all.
+    """
+    margins = stability_margin(den_coeffs_stack)
+    frac_stable = float(np.mean(margins < 0)) if len(margins) else float("nan")
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.hist(margins, bins=30, color="#4C72B0", edgecolor="white", alpha=0.9)
+    ax.axvline(0, color="#C44E52", linewidth=1.5, linestyle="--", label="stability boundary")
+    ax.axvline(float(np.mean(margins)), color="black", linestyle=":", linewidth=1.2,
+               label=f"mean = {np.mean(margins):.4g}")
+    ax.set_xlabel("max(Re(pole))  --  negative = stable")
+    ax.set_ylabel("count")
+    ax.set_title(f"{title}\n{100 * frac_stable:.1f}% stable (n={len(margins)})")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_temperature_stability_profile(
+    temp_values: np.ndarray,
+    den_coeffs_stack: np.ndarray,
+    temp_label: str = "Temperature (C)",
+    save_path: Optional[Union[str, Path]] = None,
+) -> Figure:
+    """
+    Two panels: histogram of the temperature values actually sampled, and a
+    scatter of temperature vs stability margin (max pole real part) with a
+    linear trend line -- shows whether/how temperature pushes the system
+    toward instability. Uses stability_margin() rather than any specific
+    scalar metric, so this works regardless of circuit topology; `temp_values`
+    and `den_coeffs_stack` must already be aligned to the same successful runs.
+    """
+    temp_values = np.asarray(temp_values, dtype=float)
+    margins = stability_margin(den_coeffs_stack)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    ax1.hist(temp_values, bins=15, color="#d62728", edgecolor="black", alpha=0.7)
+    if len(temp_values):
+        ax1.axvline(float(np.mean(temp_values)), color="darkred", linestyle="--", linewidth=2,
+                    label=f"mean = {np.mean(temp_values):.1f}")
+        ax1.legend(fontsize=8)
+    ax1.set_xlabel(temp_label)
+    ax1.set_ylabel("count")
+    ax1.set_title("Sampled temperature distribution")
+
+    ax2.scatter(temp_values, margins, color="#d62728", edgecolors="k", alpha=0.75, s=30)
+    ax2.axhline(0, color="black", linewidth=1, linestyle="--", label="stability boundary")
+    if len(temp_values) > 1 and np.std(temp_values) > 0:
+        coeffs = np.polyfit(temp_values, margins, 1)
+        order = np.argsort(temp_values)
+        ax2.plot(temp_values[order], np.poly1d(coeffs)(temp_values[order]),
+                 "k--", linewidth=1.5, label="linear trend")
+    ax2.set_xlabel(temp_label)
+    ax2.set_ylabel("max(Re(pole))")
+    ax2.set_title("Temperature vs stability margin")
+    ax2.legend(fontsize=8)
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_transfer_function_latex(
+    num_coeffs,
+    den_coeffs,
+    title: str = "Fitted transfer function",
+    subtitle: Optional[str] = None,
+    variable: str = "s",
+    sig_figs: int = 4,
+    fontsize: int = 20,
+    save_path: Optional[Union[str, Path]] = None,
+) -> Figure:
+    """
+    Renders H(s) = N(s)/D(s) as a typeset equation with a real fraction, in
+    its own matplotlib figure (a separate window when shown interactively).
+
+    The equation is generated entirely from the coefficient VALUES passed
+    in via stability.transfer_function_to_latex() -- nothing is hardcoded,
+    so a 1st-order and a 6th-order fit render correspondingly different
+    equations automatically. Both arrays are highest-power-first, matching
+    the rest of this library.
+
+    Rendering uses matplotlib's built-in mathtext, so no LaTeX installation
+    is required. `subtitle` is handy for carrying context that isn't part
+    of the equation itself (selected order, RSS, condition number, ...).
+    """
+    latex = transfer_function_to_latex(num_coeffs, den_coeffs, variable=variable, sig_figs=sig_figs)
+
+    # Width scales with the longest polynomial so long, high-order
+    # equations don't run off the edge of the figure.
+    longest = max(len(str(num_coeffs)), len(str(den_coeffs)))
+    width = max(8.0, min(20.0, 6.0 + 0.10 * longest))
+    fig = plt.figure(figsize=(width, 3.6))
+    try:
+        fig.canvas.manager.set_window_title(title)
+    except Exception:
+        pass  # headless/Agg backend has no window manager -- harmless
+
+    fig.text(0.5, 0.94, title, ha="center", va="top", fontsize=13, fontweight="bold")
+    fig.text(0.5, 0.50, f"${latex}$", ha="center", va="center", fontsize=fontsize)
+    if subtitle:
+        fig.text(0.5, 0.07, subtitle, ha="center", va="bottom", fontsize=9, color="#555555")
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
 
 
 

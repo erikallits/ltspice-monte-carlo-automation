@@ -103,7 +103,41 @@ class TestDetectNetlist(unittest.TestCase):
         comps = detect_components_in_netlist(text)
         self.assertEqual(len(comps), 0)
 
-    def test_kinds_filter(self):
+    def test_unedited_placeholder_value_treated_as_unset_not_unsupported(self):
+        # Regression test: LTspice's OWN default symbol text ("R" on a
+        # never-edited resistor, "C" on a capacitor) must be treated like
+        # "no value set", not skipped as an unparseable model reference.
+        # This is drawn directly from a real reported netlist (a twin-T
+        # notch filter with an LM741, none of whose 7 R/C values were ever
+        # actually edited from LTspice's placeholder defaults).
+        text = (
+            "Vin vin 0 SINE(0 1 1k) AC 1\n"
+            "R1 vin N002 R\n"
+            "R2 N002 0 R\n"
+            "C1 N003 0 C\n"
+            "X\u00a7U1 N003 N002 Vcc Vee vout LM741\n"
+            ".ac lin 20 0.1 10k\n"
+        )
+        comps = detect_components_in_netlist(text)
+        by_ref = {c.ref: c for c in comps}
+        self.assertEqual(set(by_ref), {"R1", "R2", "C1"})  # X\u00a7U1 correctly excluded (not R/C/L)
+        for ref in ("R1", "R2", "C1"):
+            self.assertTrue(by_ref[ref].supported, msg=ref)
+            self.assertIsNone(by_ref[ref].nominal, msg=ref)
+            self.assertFalse(by_ref[ref].already_parameterized, msg=ref)
+
+    def test_placeholder_check_is_kind_specific_not_just_any_bare_letter(self):
+        # "R" on a resistor is the placeholder; "R" on a capacitor would NOT
+        # be (that's not what LTspice would ever generate, so if it somehow
+        # appeared it should still be treated as an unparseable value, not
+        # silently reinterpreted).
+        text = "C1 a b R\n"
+        comps = detect_components_in_netlist(text)
+        self.assertEqual(len(comps), 1)
+        self.assertFalse(comps[0].supported)
+        self.assertIsNone(comps[0].nominal)
+
+
         text = "R1 a b 1k\nC1 a b 1n\nL1 a b 1u\n"
         comps = detect_components_in_netlist(text, kinds=("R",))
         self.assertEqual([c.ref for c in comps], ["R1"])

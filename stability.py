@@ -67,8 +67,10 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -113,14 +115,60 @@ def analytical_den_second_order(
 # Transfer function extraction -- numerical least-squares fit (Levy's method)
 # ---------------------------------------------------------------------------
 
-def _build_lstsq_system(freq_hz: np.ndarray, h_complex: np.ndarray, num_order: int, den_order: int):
-    """Shared matrix construction, used by both the fit itself and the
-    automatic-order-selection condition-number diagnostic."""
-    s = 1j * 2.0 * np.pi * np.asarray(freq_hz, dtype=float)
+def _coerce_freq_real(freq_hz: np.ndarray) -> np.ndarray:
+    """
+    Defense-in-depth mirror of metrics.py's _coerce_real: freq_hz normally
+    already arrives real (get_axis() fixes this at the source), but these
+    functions are public and may be called directly with a raw axis that
+    still has LTspice's complex-but-really-real AC-axis storage quirk.
+    Explicit, validated coercion instead of relying on an implicit,
+    warning-producing dtype cast that silently discards data either way.
+    """
+    freq_hz = np.asarray(freq_hz)
+    if not np.iscomplexobj(freq_hz):
+        return freq_hz.astype(float)
+    max_imag = float(np.max(np.abs(freq_hz.imag))) if freq_hz.size else 0.0
+    max_real = float(np.max(np.abs(freq_hz.real))) if freq_hz.size else 0.0
+    if max_imag > 1e-6 * max(max_real, 1.0):
+        raise ValueError(
+            f"freq_hz has a non-negligible imaginary part (max |imag|={max_imag:.4g} vs "
+            f"max |real|={max_real:.4g}) -- refusing to silently discard it."
+        )
+    return freq_hz.real
+
+
+def _default_omega_ref(freq_hz: np.ndarray) -> float:
+    """
+    Geometric mean of the (positive) frequency range, as an angular
+    frequency -- centers the normalized s_hat's dynamic range around 1
+    regardless of how many decades the sweep spans.
+    """
+    freq_hz = _coerce_freq_real(freq_hz)
+    positive = freq_hz[freq_hz > 0]
+    if len(positive) == 0:
+        return 1.0
+    return float(2.0 * np.pi * np.sqrt(positive.min() * positive.max()))
+
+
+def _build_lstsq_system(
+    freq_hz: np.ndarray, h_complex: np.ndarray, num_order: int, den_order: int, omega_ref: float = 1.0,
+):
+    """
+    Shared matrix construction, used by both the fit itself and the
+    automatic-order-selection condition-number diagnostic. Builds the
+    system in NORMALIZED s_hat = s/omega_ref space: raw s^k for k>=2 over a
+    multi-decade sweep spans many more orders of magnitude than s_hat^k
+    does, which is most of what actually causes ill-conditioning here --
+    normalizing fixes it at the source rather than leaving it for a
+    condition-number filter to catch after the fact (see
+    fit_transfer_function_lstsq for how the result gets un-normalized back
+    to true s afterward).
+    """
+    s_hat = (1j * 2.0 * np.pi * _coerce_freq_real(freq_hz)) / omega_ref
     h = np.asarray(h_complex, dtype=complex)
-    cols = [s ** m for m in range(num_order + 1)] + [-h * (s ** k) for k in range(den_order)]
+    cols = [s_hat ** m for m in range(num_order + 1)] + [-h * (s_hat ** k) for k in range(den_order)]
     A = np.stack(cols, axis=1)
-    b = h * (s ** den_order)
+    b = h * (s_hat ** den_order)
     return np.vstack([A.real, A.imag]), np.concatenate([b.real, b.imag])
 
 
@@ -129,6 +177,7 @@ def fit_transfer_function_lstsq(
     h_complex: np.ndarray,
     num_order: int,
     den_order: int,
+    omega_ref: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Levy's method: a single linear least-squares solve fitting a rational
@@ -136,7 +185,12 @@ def fit_transfer_function_lstsq(
     H(j*2*pi*f), with the denominator's leading coefficient normalized to 1.
 
     Returns (num_coeffs, den_coeffs), both highest-power-first (the
-    convention numpy.roots/numpy.polyval expect).
+    convention numpy.roots/numpy.polyval expect), in terms of the TRUE
+    (unnormalized) s -- `omega_ref` (default: geometric mean of the
+    frequency range) is purely an internal conditioning aid; the returned
+    coefficients don't depend on it (verified directly in
+    tests/test_auto_order_selection.py by fitting the same data with
+    omega_ref=1 and the default, and checking they agree).
 
     Real limitations, please read before trusting the output:
       * You must know/choose num_order and den_order for THIS function --
@@ -145,23 +199,38 @@ def fit_transfer_function_lstsq(
         docstring) for a whole batch.
       * This is a LINEAR approximation (not iterative refinement like
         Sanathanan-Koerner or vector fitting), fast and simple but
-        implicitly weights high-frequency samples more heavily and can be
-        ill-conditioned for high orders or a sweep that doesn't span well
-        past the poles/zeros of interest. Use a dense sweep covering at
-        least 1-2 decades on either side of the expected pole locations.
+        implicitly weights high-frequency samples more heavily. Frequency
+        normalization fixes the conditioning damage from a wide-span sweep,
+        but it can't fix a sweep that's simply too SPARSE, or too LINEARLY
+        spaced, to resolve your circuit's poles/zeros at all -- see
+        check_frequency_sweep() and use a dense, log-spaced (.ac dec ...)
+        sweep, especially for anything frequency-selective like a notch.
       * Prefer analytical_den_single_pole/second_order (or your own
         topology-derived formula) whenever you actually know the circuit's
         structure -- it's exact, this is not.
     """
+    freq_hz = _coerce_freq_real(freq_hz)
     if len(freq_hz) < num_order + den_order + 1:
         raise ValueError(
             f"Need at least {num_order + den_order + 1} frequency points for a "
             f"(num_order={num_order}, den_order={den_order}) fit, got {len(freq_hz)}."
         )
-    A_ri, b_ri = _build_lstsq_system(freq_hz, h_complex, num_order, den_order)
+    if omega_ref is None:
+        omega_ref = _default_omega_ref(freq_hz)
+
+    A_ri, b_ri = _build_lstsq_system(freq_hz, h_complex, num_order, den_order, omega_ref)
     x, *_ = np.linalg.lstsq(A_ri, b_ri, rcond=None)
-    num_coeffs = x[: num_order + 1][::-1]
-    den_coeffs = np.concatenate([x[num_order + 1:], [1.0]])[::-1]
+    num_hat = x[: num_order + 1][::-1]                            # highest-power-first, in s_hat
+    den_hat = np.concatenate([x[num_order + 1:], [1.0]])[::-1]    # highest-power-first, in s_hat, leading=1
+
+    # D(s) := omega_ref^den_order * D_hat(s/omega_ref) keeps the leading
+    # coefficient exactly 1 automatically (den_hat's leading term already
+    # is 1 by construction); N(s) must be scaled by the SAME factor to
+    # preserve H(s) = N(s)/D(s) unchanged.
+    den_powers = np.arange(den_order, -1, -1)
+    den_coeffs = den_hat * (omega_ref ** (den_order - den_powers))
+    num_powers = np.arange(num_order, -1, -1)
+    num_coeffs = num_hat * (omega_ref ** (den_order - num_powers))
     return num_coeffs, den_coeffs
 
 
@@ -192,6 +261,203 @@ def make_fitted_extractor(
 
 
 # ---------------------------------------------------------------------------
+# LaTeX rendering of a fitted transfer function
+# ---------------------------------------------------------------------------
+
+def _format_coefficient_latex(value: float, sig_figs: int = 4) -> str:
+    """Formats one coefficient for display: scientific notation (as a
+    proper `m \\times 10^{e}`, not Python's `e+07`) outside a comfortable
+    decimal range, plain decimal otherwise."""
+    if value == 0:
+        return "0"
+    abs_val = abs(value)
+    if abs_val >= 1e4 or abs_val < 1e-3:
+        exponent = int(math.floor(math.log10(abs_val)))
+        mantissa = value / (10.0 ** exponent)
+        mantissa_str = f"{mantissa:.{max(sig_figs - 1, 1)}g}"
+        return f"{mantissa_str} \\times 10^{{{exponent}}}"
+    return f"{value:.{sig_figs}g}"
+
+
+def _polynomial_to_latex(coeffs: Sequence[float], variable: str = "s", sig_figs: int = 4) -> str:
+    """coeffs: highest-power-first (numpy.roots convention). Builds a LaTeX
+    polynomial string entirely from the given coefficients -- every term,
+    sign, and power is derived from the actual values, nothing hardcoded."""
+    coeffs = list(coeffs)
+    n = len(coeffs)
+    terms: List[Tuple[str, str]] = []
+    for i, c in enumerate(coeffs):
+        if c == 0:
+            continue
+        power = n - 1 - i
+        coeff_str = _format_coefficient_latex(abs(c), sig_figs)
+        sign = "-" if c < 0 else "+"
+
+        if power == 0:
+            term = coeff_str
+        elif power == 1:
+            term = variable if coeff_str == "1" else f"{coeff_str} {variable}"
+        else:
+            term = f"{variable}^{{{power}}}" if coeff_str == "1" else f"{coeff_str} {variable}^{{{power}}}"
+        terms.append((sign, term))
+
+    if not terms:
+        return "0"
+    latex = terms[0][1] if terms[0][0] == "+" else f"-{terms[0][1]}"
+    for sign, term in terms[1:]:
+        latex += f" {sign} {term}"
+    return latex
+
+
+def transfer_function_to_latex(
+    num_coeffs: Sequence[float], den_coeffs: Sequence[float], variable: str = "s", sig_figs: int = 4,
+) -> str:
+    """
+    Renders H(s) = N(s)/D(s) as a LaTeX string, generated entirely from the
+    actual coefficient VALUES passed in (both highest-power-first, matching
+    every other coefficient array in this module) -- nothing about the
+    equation's shape, terms, or numbers is hardcoded; a 1st-order and a
+    6th-order fit produce correspondingly different output automatically.
+    Compatible with matplotlib mathtext (wrap in `$...$`) as well as a real
+    LaTeX renderer -- see visualization.plot_transfer_function_latex().
+    """
+    num_latex = _polynomial_to_latex(num_coeffs, variable, sig_figs)
+    den_latex = _polynomial_to_latex(den_coeffs, variable, sig_figs)
+    return f"\\mathrm{{H}}({variable}) = \\frac{{{num_latex}}}{{{den_latex}}}"
+
+
+# ---------------------------------------------------------------------------
+# Frequency sweep quality diagnostic
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FrequencySweepQuality:
+    n_points: int
+    looks_log_spaced: bool
+    min_freq: float
+    max_freq: float
+    decades_spanned: float
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def is_adequate(self) -> bool:
+        return not self.warnings
+
+
+def check_frequency_sweep(freq_hz: np.ndarray, min_points_per_decade: float = 20.0) -> FrequencySweepQuality:
+    """
+    Sanity-checks an AC sweep's suitability for transfer-function fitting,
+    independent of anything else in this module. Rational-function fitting
+    (and therefore automatic order selection, and therefore Kharitonov)
+    needs DENSE, roughly LOG-spaced frequency coverage: poles and zeros
+    shape a response across decades, not linear Hz, so a sparse or
+    linearly-spaced sweep starves the fit of resolution exactly where it
+    matters -- most severely for anything frequency-selective, like a notch
+    or a sharp resonance, where the interesting behavior can fall entirely
+    between two widely-spaced sample points.
+
+    This diagnoses a DATA problem, not a code bug -- if your `.ac` directive
+    looks like `.ac lin 20 0.1 10k`, that's very likely why a fit looks
+    wrong, not a defect in the fitting itself. See set_ac_analysis() to
+    replace it with a dense, log-spaced sweep.
+    """
+    freq_hz = _coerce_freq_real(freq_hz)
+    freq_hz = np.sort(freq_hz[freq_hz > 0])
+    n = len(freq_hz)
+    if n < 2:
+        return FrequencySweepQuality(n, False, float("nan"), float("nan"), float("nan"),
+                                      ["fewer than 2 positive frequency points -- can't assess sweep quality"])
+
+    decades = float(math.log10(freq_hz[-1] / freq_hz[0])) if freq_hz[0] > 0 else float("nan")
+    ratios = freq_hz[1:] / freq_hz[:-1]
+    diffs = np.diff(freq_hz)
+    log_cv = float(np.std(ratios) / np.mean(ratios)) if np.mean(ratios) > 0 else float("inf")
+    lin_cv = float(np.std(diffs) / np.mean(diffs)) if np.mean(diffs) > 0 else float("inf")
+    looks_log_spaced = log_cv < lin_cv
+
+    warnings_list: List[str] = []
+    if n < 20:
+        warnings_list.append(
+            f"only {n} frequency points -- fits (especially for anything frequency-selective, like a "
+            "notch or sharp resonance) need dense coverage; consider '.ac dec 100 ...' or denser."
+        )
+    if not looks_log_spaced and decades > 1:
+        warnings_list.append(
+            f"the sweep spans {decades:.1f} decades but looks LINEARLY spaced, not log-spaced -- most "
+            "points end up bunched at the high-frequency end with almost none at low frequency. Use "
+            "'.ac dec <points_per_decade> <fstart> <fstop>' instead of '.ac lin ...' for anything "
+            "spanning more than about a decade."
+        )
+    elif decades > 0 and (n / decades) < min_points_per_decade:
+        warnings_list.append(
+            f"only {n / decades:.1f} points per decade over {decades:.1f} decades -- consider raising "
+            f"the point count in your .ac directive (aim for {min_points_per_decade:.0f}+ per decade) "
+            "for a more reliable fit."
+        )
+
+    return FrequencySweepQuality(
+        n_points=n, looks_log_spaced=looks_log_spaced, min_freq=float(freq_hz[0]), max_freq=float(freq_hz[-1]),
+        decades_spanned=decades, warnings=warnings_list,
+    )
+
+
+def set_ac_analysis(
+    path: Union[str, Path],
+    sweep_type: str = "dec",
+    points: int = 100,
+    fstart: float = 1.0,
+    fstop: float = 1e6,
+    output_path: Optional[Union[str, Path]] = None,
+) -> Path:
+    """
+    Replaces any existing `.ac` directive in a plain SPICE netlist with a
+    new one -- surgically (finds and replaces the line(s) in place), not by
+    appending a second, conflicting `.ac` directive -- so you can guarantee
+    dense, log-spaced coverage for reliable transfer-function fitting
+    without hand-editing the netlist yourself.
+
+    `sweep_type`: "dec" (points per decade, recommended -- matches how
+    poles/zeros shape the response) or "oct"/"lin" if you specifically want
+    those instead. Pick `fstart`/`fstop` with real margin around whatever
+    frequency you care about (a notch, a corner frequency, ...) -- at least
+    a decade on either side if you can.
+
+    Only supports plain netlists (.net/.cir) for now -- generate a netlist
+    from LTspice (File > Generate Netlist) first if you're working from a
+    .asc schematic directly.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".asc":
+        raise ValueError(
+            "set_ac_analysis() only edits plain netlists right now, not .asc schematics directly -- "
+            "generate a netlist (File > Generate Netlist in LTspice) and point this at that file "
+            "instead, or edit the .ac directive in the schematic yourself."
+        )
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    new_directive = f".ac {sweep_type} {points} {fstart:g} {fstop:g}"
+    ac_re = re.compile(r"^\.ac\b", re.IGNORECASE)
+
+    kept: List[str] = []
+    replaced = False
+    for line in lines:
+        if ac_re.match(line.strip()):
+            if not replaced:
+                kept.append(new_directive)
+                replaced = True
+            # else: a second/redundant .ac line -- drop it rather than
+            # leaving two directives that could conflict.
+        else:
+            kept.append(line)
+    if not replaced:
+        end_idx = next((i for i, l in enumerate(kept) if l.strip().lower() == ".end"), len(kept))
+        kept.insert(end_idx, new_directive)
+
+    out_path = Path(output_path) if output_path else path
+    out_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Automatic order selection
 # ---------------------------------------------------------------------------
 
@@ -212,9 +478,16 @@ class AutoFitResult:
     best: OrderCandidate
     candidates: List[OrderCandidate]
     criterion: str  # "aic" | "bic"
+    sweep_quality: Optional[FrequencySweepQuality] = None
 
     def summary(self) -> str:
-        lines = [
+        lines = []
+        if self.sweep_quality is not None and not self.sweep_quality.is_adequate:
+            lines.append("FREQUENCY SWEEP WARNING (check this first -- it can invalidate everything below):")
+            for w in self.sweep_quality.warnings:
+                lines.append(f"  - {w}")
+            lines.append("")
+        lines += [
             f"Automatic transfer-function order selection ({self.criterion.upper()}): "
             f"num_order={self.best.num_order}, den_order={self.best.den_order}",
             f"  RSS={self.best.rss:.4g}  AIC={self.best.aic:.4g}  BIC={self.best.bic:.4g}  "
@@ -238,19 +511,44 @@ class AutoFitResult:
         return "\n".join(lines)
 
 
+def _select_best_candidate(
+    candidates: List["OrderCandidate"], criterion: str, max_condition_number: float,
+) -> "OrderCandidate":
+    """
+    Picks the AIC/BIC-best candidate AMONG the numerically well-conditioned
+    ones -- pulled out as its own function so this selection rule (the
+    actual fix for the "ill-conditioned high order spuriously wins" failure
+    mode) is testable precisely, with constructed candidates, independent
+    of whatever a specific synthetic frequency sweep happens to produce.
+    """
+    key = (lambda c: c.aic) if criterion == "aic" else (lambda c: c.bic)
+    well_conditioned = [c for c in candidates if c.condition_number <= max_condition_number]
+    if well_conditioned:
+        return min(well_conditioned, key=key)
+    best = min(candidates, key=lambda c: c.condition_number)
+    _logger.warning(
+        "No candidate had condition number <= %.2g (best available: %.3g). "
+        "The returned order is the least-bad option, not a trustworthy fit -- treat with real "
+        "suspicion, especially if it disagrees with what you'd expect from the circuit's topology.",
+        max_condition_number, best.condition_number,
+    )
+    return best
+
+
 def auto_fit_transfer_function(
     freq_hz: np.ndarray,
     h_complex: np.ndarray,
     max_order: int = 6,
     criterion: str = "bic",
     force_proper: bool = True,
+    max_condition_number: float = 1e10,
 ) -> AutoFitResult:
     """
     Tries every (num_order, den_order) pair with den_order from 1 to
     max_order (num_order from 0 to den_order if force_proper -- the norm
     for passive/most active circuits -- else 0 to max_order), fits each via
     fit_transfer_function_lstsq, and picks the one minimizing the chosen
-    information criterion.
+    information criterion AMONG numerically well-conditioned candidates.
 
     `criterion="bic"` (default) penalizes extra parameters more heavily
     than "aic" as more data is available, which is the more appropriate
@@ -258,6 +556,22 @@ def auto_fit_transfer_function(
     order, not just the best possible predictive fit (least squares RSS can
     only improve or stay flat as order increases, so SOME penalty for
     complexity is mandatory or this would just always pick max_order).
+
+    `max_condition_number` (default 1e10, well below double precision's
+    ~1e16 floor) excludes candidates whose least-squares system is too
+    ill-conditioned to trust, REGARDLESS of what AIC/BIC say about them.
+    This matters more than it might look: once RSS bottoms out near the
+    numerical noise floor (a near-perfect fit at the true order), a
+    higher-order candidate can appear to fit EVEN better by a tiny, totally
+    spurious margin -- not because it captures real structure, but because
+    it has enough free parameters to also fit floating-point noise. AIC/BIC
+    alone can't tell that apart from genuine improvement; the condition
+    number can, because an ill-conditioned fit's COEFFICIENTS (and
+    therefore its roots/poles) are essentially undetermined even when its
+    RSS looks fine. Without this filter, such a candidate can win outright
+    and hand you Hurwitz/Kharitonov roots that are numerical noise, not a
+    real stability result -- don't lower this unless you understand that
+    tradeoff.
 
     This is fundamentally a harder, less reliable problem than knowing your
     circuit's topology -- see the module docstring. Read the returned
@@ -270,10 +584,11 @@ def auto_fit_transfer_function(
     if max_order < 1:
         raise ValueError("max_order must be >= 1")
 
-    freq_hz = np.asarray(freq_hz, dtype=float)
+    freq_hz = _coerce_freq_real(freq_hz)
     h_complex = np.asarray(h_complex, dtype=complex)
     s = 1j * 2.0 * np.pi * freq_hz
     n_obs = 2 * len(freq_hz)  # real + imaginary parts as separate real observations
+    omega_ref = _default_omega_ref(freq_hz)
 
     candidates: List[OrderCandidate] = []
     for den_order in range(1, max_order + 1):
@@ -282,7 +597,7 @@ def auto_fit_transfer_function(
             if len(freq_hz) < num_order + den_order + 1:
                 continue
             try:
-                num, den = fit_transfer_function_lstsq(freq_hz, h_complex, num_order, den_order)
+                num, den = fit_transfer_function_lstsq(freq_hz, h_complex, num_order, den_order, omega_ref=omega_ref)
             except Exception:
                 continue
             if not (np.all(np.isfinite(num)) and np.all(np.isfinite(den))):
@@ -297,7 +612,11 @@ def auto_fit_transfer_function(
             aic = n_obs * math.log(rss / n_obs) + 2 * k
             bic = n_obs * math.log(rss / n_obs) + k * math.log(n_obs)
 
-            A_ri, _b_ri = _build_lstsq_system(freq_hz, h_complex, num_order, den_order)
+            # Condition number of the SAME normalized system actually
+            # solved above -- must use the same omega_ref, or this would be
+            # diagnosing a different (unnormalized) system than the one
+            # that produced `num`/`den`.
+            A_ri, _b_ri = _build_lstsq_system(freq_hz, h_complex, num_order, den_order, omega_ref=omega_ref)
             singular_values = np.linalg.svd(A_ri, compute_uv=False)
             cond = float(singular_values.max() / singular_values.min()) if singular_values.min() > 0 else float("inf")
 
@@ -309,9 +628,11 @@ def auto_fit_transfer_function(
             "try a larger max_order, or check that freq_hz/h_complex contain valid AC-analysis data."
         )
 
-    key = (lambda c: c.aic) if criterion == "aic" else (lambda c: c.bic)
-    best = min(candidates, key=key)
-    return AutoFitResult(best=best, candidates=candidates, criterion=criterion)
+    sweep_quality = check_frequency_sweep(freq_hz)
+    best = _select_best_candidate(candidates, criterion, max_condition_number)
+    return AutoFitResult(best=best, candidates=candidates, criterion=criterion, sweep_quality=sweep_quality)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +725,20 @@ def check_all_runs_stable(den_coeffs_stack: np.ndarray) -> np.ndarray:
     """
     stack = np.asarray(den_coeffs_stack, dtype=float)
     return np.array([is_hurwitz_stable(row) for row in stack])
+
+
+def stability_margin(den_coeffs_stack: np.ndarray) -> np.ndarray:
+    """
+    max(Re(roots)) per row of den_coeffs_stack (shape (n_runs, n_coeffs),
+    highest power first) -- negative means Hurwitz stable, with magnitude
+    as a rough margin (more negative = further from the instability
+    boundary); positive means unstable. The natural, circuit-agnostic
+    scalar to histogram/plot per Monte Carlo sample or corner: unlike a
+    domain-specific metric (bandwidth, gain, ...), this is always available
+    the moment you have D(s), regardless of topology.
+    """
+    stack = np.asarray(den_coeffs_stack, dtype=float)
+    return np.array([float(np.max(np.roots(row).real)) for row in stack])
 
 
 # ---------------------------------------------------------------------------

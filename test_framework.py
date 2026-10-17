@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ltspice_mc.param_utils import discover_parameters, parse_spice_value
 from ltspice_mc.distributions import Gaussian, Uniform, Tolerance, Custom
+from ltspice_mc.metrics import get_axis as _get_axis_fn
 from ltspice_mc.metrics import (
     compute_rms, compute_mean, compute_peak_to_peak, compute_gain_db,
     compute_phase_deg, compute_bandwidth, compute_phase_margin,
@@ -257,6 +258,39 @@ class TestTimeDomainMetrics(unittest.TestCase):
         self.assertGreater(overshoot, 5.0)
         settling = compute_settling_time(raw, "V(out)", tolerance_pct=2.0, final_value=1.0)
         self.assertTrue(0.0 < settling < 1.0)
+
+
+class TestComplexAxisCoercion(unittest.TestCase):
+    """LTspice's raw AC-analysis data stores the frequency axis itself as
+    complex128 (imaginary part always ~0) -- a storage-format quirk, not a
+    physical property of frequency. get_axis() must handle this cleanly."""
+
+    def test_complex_axis_with_zero_imag_coerced_to_real(self):
+        raw = MockRawRead(np.array([1.0, 10.0, 100.0], dtype=complex), {"unused": [0, 0, 0]})
+        axis = _get_axis_fn(raw)
+        self.assertFalse(np.iscomplexobj(axis))
+        np.testing.assert_array_almost_equal(axis, [1.0, 10.0, 100.0])
+
+    def test_real_axis_passes_through_unchanged(self):
+        raw = MockRawRead(np.array([1.0, 10.0, 100.0]), {"unused": [0, 0, 0]})
+        axis = _get_axis_fn(raw)
+        self.assertFalse(np.iscomplexobj(axis))
+        np.testing.assert_array_almost_equal(axis, [1.0, 10.0, 100.0])
+
+    def test_genuinely_complex_axis_raises_instead_of_silently_corrupting(self):
+        # A meaningfully nonzero imaginary part should NOT be silently
+        # discarded -- that would indicate something is actually wrong,
+        # not just the harmless storage quirk.
+        raw = MockRawRead(np.array([1.0 + 5.0j, 10.0 + 3.0j]), {"unused": [0, 0]})
+        with self.assertRaises(ValueError):
+            _get_axis_fn(raw)
+
+    def test_no_complex_warning_emitted(self):
+        import warnings
+        raw = MockRawRead(np.array([1.0, 10.0, 100.0], dtype=complex), {"unused": [0, 0, 0]})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning -> test failure
+            _get_axis_fn(raw)
 
 
 class TestFrequencyDomainMetrics(unittest.TestCase):

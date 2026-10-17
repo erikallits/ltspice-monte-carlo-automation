@@ -9,6 +9,7 @@ complexity penalty were missing or broken, since least-squares RSS can only
 improve or plateau as more parameters are added).
 """
 
+import math
 import sys
 import tempfile
 import unittest
@@ -83,14 +84,42 @@ class TestAutoFitTransferFunction(unittest.TestCase):
             self.assertEqual(result.best.den_order, 2, msg=f"failed for seed={seed}")
 
     def test_summary_flags_max_order_ceiling(self):
-        # A 4th-order true system with max_order capped AT the true order --
-        # selection lands exactly at the ceiling, and summary() must say so.
-        w0 = 2 * np.pi * 1000.0
-        true_den = np.poly([-w0, -w0 * 1.5, -w0 * 0.7, -w0 * 2.0])  # 4 real poles, all stable
-        freq, h = _synthetic_ac_data(true_num=[w0 ** 4], true_den=true_den, freq_decades=(1, 5))
-        result = auto_fit_transfer_function(freq, h, max_order=4, criterion="bic")
-        self.assertEqual(result.best.den_order, 4)
+        # Tests summary()'s ceiling-detection logic directly, via a
+        # constructed AutoFitResult -- decoupled from whether a specific
+        # synthetic frequency sweep happens to land the SEARCH at the
+        # ceiling, which now also depends on conditioning (tested
+        # separately below), not just AIC/BIC.
+        from ltspice_mc.stability import AutoFitResult, OrderCandidate
+        candidates = [
+            OrderCandidate(0, 1, np.array([1.0]), np.array([1.0, 1.0]), rss=10.0, aic=5.0, bic=6.0, condition_number=10.0),
+            OrderCandidate(0, 2, np.array([1.0]), np.array([1.0, 1.0, 1.0]), rss=1.0, aic=1.0, bic=2.0, condition_number=10.0),
+        ]
+        result = AutoFitResult(best=candidates[1], candidates=candidates, criterion="bic")
         self.assertIn("largest den_order tried", result.summary())
+
+    def test_ill_conditioned_candidate_does_not_win_even_with_better_bic(self):
+        # Direct regression test for the reported bug: an ill-conditioned
+        # higher-order candidate with a SPURIOUSLY better (lower) BIC must
+        # NOT be selected over a well-conditioned lower-order one.
+        from ltspice_mc.stability import OrderCandidate, _select_best_candidate
+        good = OrderCandidate(0, 2, np.array([1.0]), np.array([1.0, 1.0, 1.0]),
+                               rss=3.5e-25, aic=-2516, bic=-2510, condition_number=1e4)
+        bad = OrderCandidate(2, 4, np.array([1.0, 1.0, 1.0]), np.array([1.0] * 5),
+                              rss=1.65e-25, aic=-2540, bic=-2527, condition_number=5.84e28)
+        # Without any filter, `bad` would win on raw BIC (-2527 < -2510) --
+        # this is exactly the reported failure. With the default threshold,
+        # `good` must win instead.
+        self.assertLess(bad.bic, good.bic)  # sanity: confirms bad WOULD win unfiltered
+        selected = _select_best_candidate([good, bad], criterion="bic", max_condition_number=1e10)
+        self.assertIs(selected, good)
+
+    def test_all_candidates_ill_conditioned_falls_back_with_warning(self):
+        from ltspice_mc.stability import OrderCandidate, _select_best_candidate
+        c1 = OrderCandidate(0, 1, np.array([1.0]), np.array([1.0, 1.0]), rss=1.0, aic=1.0, bic=1.0, condition_number=1e15)
+        c2 = OrderCandidate(0, 2, np.array([1.0]), np.array([1.0, 1.0, 1.0]), rss=1.0, aic=2.0, bic=2.0, condition_number=1e20)
+        with self.assertLogs("ltspice_mc.stability", level="WARNING"):
+            selected = _select_best_candidate([c1, c2], criterion="bic", max_condition_number=1e10)
+        self.assertIs(selected, c1)  # least-bad conditioning wins the fallback, not AIC/BIC
 
     def test_invalid_criterion_raises(self):
         freq, h = _synthetic_ac_data(true_num=[1.0], true_den=[1.0, 1.0])
@@ -113,7 +142,257 @@ class TestAutoFitTransferFunction(unittest.TestCase):
         self.assertGreater(result.best.condition_number, 0)
 
 
-class TestMakeFittedExtractor(unittest.TestCase):
+class TestTransferFunctionLatex(unittest.TestCase):
+    """The key property: every term, sign, power and number comes from the
+    coefficient VALUES passed in -- nothing about the equation is hardcoded."""
+
+    def test_first_order_exact_string(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        latex = transfer_function_to_latex([5000.0], [1.0, 5000.0])
+        self.assertEqual(latex, "\\mathrm{H}(s) = \\frac{5000}{s + 5000}")
+
+    def test_order_changes_output_dynamically(self):
+        # Same call, different coefficient counts -> correspondingly
+        # different equations. If anything were hardcoded, these would match.
+        from ltspice_mc.stability import transfer_function_to_latex
+        first = transfer_function_to_latex([1.0], [1.0, 2.0])
+        third = transfer_function_to_latex([1.0], [1.0, 2.0, 3.0, 4.0])
+        self.assertNotEqual(first, third)
+        self.assertIn("s^{3}", third)
+        self.assertNotIn("s^{3}", first)
+
+    def test_zero_coefficients_omitted(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        # s^2 + 0*s + 4  ->  the zero term must not appear at all
+        latex = transfer_function_to_latex([1.0], [1.0, 0.0, 4.0])
+        self.assertIn("s^{2} + 4", latex)
+        self.assertNotIn("0 s", latex)
+
+    def test_negative_coefficients_render_as_minus(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        latex = transfer_function_to_latex([1.0], [1.0, -2.5, 4.0])
+        self.assertIn("- 2.5 s", latex)
+        self.assertNotIn("+ -", latex)
+
+    def test_unit_coefficient_omits_redundant_one(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        latex = transfer_function_to_latex([1.0], [1.0, 1.0])
+        self.assertIn("\\frac{1}{s + 1}", latex)
+        self.assertNotIn("1 s", latex)
+
+    def test_scientific_notation_for_large_values(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        latex = transfer_function_to_latex([1.0], [1.0, 3.95e7])
+        self.assertIn("\\times 10^{7}", latex)
+        self.assertNotIn("e+07", latex)  # must not leak Python's float repr
+
+    def test_scientific_notation_for_tiny_values(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        latex = transfer_function_to_latex([1e-7], [1.0, 2.5e-5])
+        self.assertIn("\\times 10^{-7}", latex)
+        self.assertNotIn("e-07", latex)
+
+    def test_custom_variable_name(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        latex = transfer_function_to_latex([1.0], [1.0, 2.0], variable="p")
+        self.assertIn("\\mathrm{H}(p)", latex)
+        self.assertIn("p + 2", latex)
+        self.assertNotIn("s", latex)
+
+    def test_always_contains_a_fraction(self):
+        from ltspice_mc.stability import transfer_function_to_latex
+        for num, den in ([[1.0], [1.0, 2.0]], [[3.0, 1.0], [1.0, 0.0, 5.0]]):
+            self.assertIn("\\frac{", transfer_function_to_latex(num, den))
+
+    def test_renders_without_mathtext_warnings(self):
+        import warnings
+        import matplotlib
+        matplotlib.use("Agg")
+        from ltspice_mc.visualization import plot_transfer_function_latex
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any mathtext parse issue -> failure
+            fig = plot_transfer_function_latex(
+                [1.0, 0.0, 3.95e7], [1.0, 1256.6, 3.95e7], subtitle="num=2, den=2",
+            )
+        self.assertIsNotNone(fig)
+
+    def test_end_to_end_from_a_real_fit(self):
+        # The realistic path: fit synthetic data, render whatever came out.
+        from ltspice_mc.stability import fit_transfer_function_lstsq, transfer_function_to_latex
+        freq = np.logspace(1, 5, 200)
+        w0, q = 2 * math.pi * 1000, 5.0
+        s = 1j * 2 * math.pi * freq
+        h = (s ** 2 + w0 ** 2) / (s ** 2 + s * w0 / q + w0 ** 2)
+        num, den = fit_transfer_function_lstsq(freq, h, num_order=2, den_order=2)
+        latex = transfer_function_to_latex(num, den)
+        self.assertIn("\\frac{", latex)
+        self.assertIn("s^{2}", latex)
+
+
+class TestStabilityMarginAndPlots(unittest.TestCase):
+    def test_stability_margin_matches_direct_root_finding(self):
+        from ltspice_mc.stability import stability_margin
+        stack = np.array([[1.0, 6.0, 11.0, 6.0], [1.0, 4.0, -5.0, -6.0]])
+        margins = stability_margin(stack)
+        self.assertEqual(len(margins), 2)
+        # first is stable (all roots negative real part) -> margin < 0
+        self.assertLess(margins[0], 0)
+        # second has a root at s=+1 (unstable) -> margin > 0
+        self.assertGreater(margins[1], 0)
+
+    def test_plot_stability_margin_histogram_smoke(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        from ltspice_mc.visualization import plot_stability_margin_histogram
+        stack = np.array([[1.0, 6.0, 11.0, 6.0]] * 10)
+        fig = plot_stability_margin_histogram(stack)
+        self.assertIsNotNone(fig)
+        self.assertIn("100.0% stable", fig.axes[0].get_title())
+
+    def test_plot_temperature_stability_profile_smoke(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        from ltspice_mc.visualization import plot_temperature_stability_profile
+        stack = np.array([[1.0, 6.0, 11.0, 6.0]] * 10)
+        temps = np.linspace(-40, 125, 10)
+        fig = plot_temperature_stability_profile(temps, stack)
+        self.assertEqual(len(fig.axes), 2)
+
+
+class TestFrequencyNormalization(unittest.TestCase):
+    def test_normalized_and_unnormalized_fits_agree(self):
+        # For a well-conditioned case, fitting with omega_ref=1 (old
+        # behavior) and the default (geometric-mean normalization) must
+        # give the SAME true-s coefficients -- normalization is purely an
+        # internal conditioning aid and must not change the answer.
+        from ltspice_mc.stability import fit_transfer_function_lstsq
+        freq = np.logspace(1, 4, 50)
+        w0, q = 2 * math.pi * 500, 1.2
+        s = 1j * 2 * math.pi * freq
+        h = w0 ** 2 / (s ** 2 + s * w0 / q + w0 ** 2)
+
+        num1, den1 = fit_transfer_function_lstsq(freq, h, 0, 2, omega_ref=1.0)
+        num2, den2 = fit_transfer_function_lstsq(freq, h, 0, 2, omega_ref=None)
+        np.testing.assert_allclose(den1, den2, rtol=1e-6)
+        np.testing.assert_allclose(num1, num2, rtol=1e-6)
+
+    def test_wide_sweep_notch_recovers_exact_order_and_poles(self):
+        # Direct regression test for the reported notch-filter case: a
+        # sparse, LINEAR, 5-decade sweep (mirroring ".ac lin 20 0.1 10k")
+        # must still recover the true 2nd-order poles, not collapse to a
+        # spurious 1st-order fit due to poor conditioning.
+        freq = np.linspace(0.1, 10000, 20)
+        w0, q = 2 * math.pi * 1000.0, 5.0
+        s = 1j * 2 * math.pi * freq
+        h = (s ** 2 + w0 ** 2) / (s ** 2 + s * w0 / q + w0 ** 2)
+
+        result = auto_fit_transfer_function(freq, h, max_order=6, criterion="bic")
+        self.assertEqual(result.best.den_order, 2)
+        self.assertLess(result.best.condition_number, 1e7)  # was 1.265e10 before normalization
+
+        roots = np.roots(result.best.den_coeffs)
+        expected_real = -w0 / (2 * q)
+        expected_imag = w0 * math.sqrt(1 - 1 / (4 * q ** 2))
+        found_real = sorted(roots.real)[0]
+        found_imag = sorted(abs(roots.imag))[0]
+        self.assertAlmostEqual(found_real, expected_real, delta=1.0)
+        self.assertAlmostEqual(found_imag, expected_imag, delta=1.0)
+
+
+class TestFrequencySweepQuality(unittest.TestCase):
+    def test_flags_linear_wide_sweep(self):
+        from ltspice_mc.stability import check_frequency_sweep
+        freq = np.linspace(0.1, 10000, 20)  # exactly the reported .ac lin 20 0.1 10k
+        quality = check_frequency_sweep(freq)
+        self.assertFalse(quality.is_adequate)
+        self.assertFalse(quality.looks_log_spaced)
+        self.assertTrue(any("LINEARLY spaced" in w for w in quality.warnings))
+
+    def test_dense_log_sweep_is_adequate(self):
+        from ltspice_mc.stability import check_frequency_sweep
+        freq = np.logspace(0, 6, 600)  # dense, log-spaced, 6 decades
+        quality = check_frequency_sweep(freq)
+        self.assertTrue(quality.is_adequate)
+        self.assertTrue(quality.looks_log_spaced)
+
+    def test_sparse_sweep_flagged_even_if_log_spaced(self):
+        from ltspice_mc.stability import check_frequency_sweep
+        freq = np.logspace(0, 6, 8)  # log-spaced but very few points
+        quality = check_frequency_sweep(freq)
+        self.assertFalse(quality.is_adequate)
+
+    def test_auto_fit_result_surfaces_sweep_warning_first(self):
+        freq = np.linspace(0.1, 10000, 20)
+        w0 = 2 * math.pi * 1000.0
+        s = 1j * 2 * math.pi * freq
+        h = w0 ** 2 / (s ** 2 + s * w0 / 2 + w0 ** 2)
+        result = auto_fit_transfer_function(freq, h, max_order=4)
+        summary = result.summary()
+        self.assertTrue(summary.startswith("FREQUENCY SWEEP WARNING"))
+
+
+class TestSetAcAnalysis(unittest.TestCase):
+    def _write(self, text):
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".net", delete=False)
+        f.write(text)
+        f.close()
+        return Path(f.name)
+
+    def test_replaces_existing_ac_directive(self):
+        from ltspice_mc.stability import set_ac_analysis
+        text = "R1 in out 1k\nC1 out 0 1n\n.ac lin 20 0.1 10k\n.end\n"
+        path = self._write(text)
+        try:
+            out = set_ac_analysis(path, sweep_type="dec", points=100, fstart=1, fstop=1e6)
+            new_text = out.read_text()
+            self.assertIn(".ac dec 100 1 1e+06", new_text)
+            self.assertNotIn(".ac lin", new_text)
+            self.assertIn("R1 in out 1k", new_text)  # untouched
+            self.assertIn("C1 out 0 1n", new_text)   # untouched
+        finally:
+            path.unlink()
+            out.unlink(missing_ok=True)
+
+    def test_inserts_before_end_if_no_existing_directive(self):
+        from ltspice_mc.stability import set_ac_analysis
+        text = "R1 in out 1k\n.end\n"
+        path = self._write(text)
+        try:
+            out = set_ac_analysis(path, points=50, fstart=10, fstop=1e5)
+            lines = out.read_text().splitlines()
+            end_idx = lines.index(".end")
+            ac_idx = next(i for i, l in enumerate(lines) if l.startswith(".ac"))
+            self.assertLess(ac_idx, end_idx)
+        finally:
+            path.unlink()
+            out.unlink(missing_ok=True)
+
+    def test_duplicate_ac_lines_collapsed_to_one(self):
+        from ltspice_mc.stability import set_ac_analysis
+        text = ".ac lin 10 1 100\n.ac dec 5 1 1000\nR1 in out 1k\n.end\n"
+        path = self._write(text)
+        try:
+            out = set_ac_analysis(path, points=200, fstart=1, fstop=1e6)
+            lines = out.read_text().splitlines()
+            ac_lines = [l for l in lines if l.strip().lower().startswith(".ac")]
+            self.assertEqual(len(ac_lines), 1)
+        finally:
+            path.unlink()
+            out.unlink(missing_ok=True)
+
+    def test_asc_file_raises_clear_error(self):
+        from ltspice_mc.stability import set_ac_analysis
+        path = self._write("Version 4\n")
+        asc_path = path.with_suffix(".asc")
+        path.rename(asc_path)
+        try:
+            with self.assertRaises(ValueError):
+                set_ac_analysis(asc_path)
+        finally:
+            asc_path.unlink()
+
+
+
     def test_uses_fixed_order_consistently(self):
         f0, q = 1000.0, 2.0
         w0 = 2 * np.pi * f0
